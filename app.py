@@ -1,179 +1,200 @@
 import streamlit as st
-import matplotlib.pyplot as plt
 import pandas as pd
 import numpy as np
-import statsmodels.api as sm
+import matplotlib.pyplot as plt
 import seaborn as sns
 
+from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.stattools import adfuller
 from statsmodels.tsa.seasonal import STL
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
 
-from src.fetch_fred_data import fetch_fred_series
+from src.data_cleaning import load_and_clean_fred_series
 
 # ======================================================
-# Streamlit configuration
+# App configuration
 # ======================================================
-st.set_page_config(page_title="FRED Time Series Analyzer", layout="centered")
+st.set_page_config(page_title="FRED Multi-Series Analyzer", layout="centered")
 
-st.title("FRED Time Series Analyzer")
+st.title("FRED Multi-Series Analyzer")
 st.write(
-    "End-to-end pipeline for FRED time series analysis: "
-    "temporal disaggregation, preprocessing, STL decomposition, "
-    "ARMA/ARIMA modeling, rolling cross-validation, and benchmark comparison."
+    "Simple data-driven application for the analysis of up to three FRED time series."
 )
 
 # ======================================================
-# User input
+# User inputs
 # ======================================================
-fred_url = st.text_input(
-    "FRED series URL",
-    placeholder="https://fred.stlouisfed.org/series/CPIAUCSL"
-)
+st.subheader("FRED links (max 3)")
 
-convert_weekly = st.checkbox(
-    "Convert monthly data to weekly frequency (linear interpolation)",
-    value=True
+url1 = st.text_input("FRED URL 1 (required)")
+url2 = st.text_input("FRED URL 2 (optional)")
+url3 = st.text_input("FRED URL 3 (optional)")
+
+st.subheader("Options")
+resample_weekly = st.checkbox(
+    "Aggregate data to weekly frequency",
+    value=False,
+    help="Recommended for STL decomposition (seasonal period = 52)."
 )
 
 run = st.button("Run analysis")
 
 # ======================================================
-# Helper: monthly → weekly interpolation
-# ======================================================
-def monthly_to_weekly(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.set_index("date").asfreq("MS")
-    df = df.resample("W").interpolate(method="linear")
-    return df.reset_index()
-
-# ======================================================
-# Helper: rolling cross-validation
-# ======================================================
-def rolling_cv(series, order, initial_window, horizon=1):
-    """
-    Expanding-window rolling cross-validation for ARMA / ARIMA models.
-    """
-    errors = []
-
-    for t in range(initial_window, len(series) - horizon):
-        train = series.iloc[:t]
-
-        try:
-            model = sm.tsa.ARIMA(train, order=order).fit()
-            forecast = model.get_forecast(steps=horizon)
-            pred = forecast.predicted_mean.iloc[-1]
-            true = series.iloc[t]
-            errors.append(true - pred)
-        except Exception:
-            continue
-
-    return np.array(errors)
-
-# ======================================================
 # Main logic
 # ======================================================
-if fred_url and run:
+if run and url1:
+
     try:
-        # ==================================================
-        # 1. Data retrieval
-        # ==================================================
-        series_id = fred_url.rstrip("/").split("/")[-1]
-        df = fetch_fred_series(series_id)
-        df = df.sort_values("date").reset_index(drop=True)
+        # ----------------------------------------------
+        # 1) Extract series IDs
+        # ----------------------------------------------
+        urls = [url1, url2, url3]
+        series_ids = [
+            u.rstrip("/").split("/")[-1]
+            for u in urls if u is not None and u.strip() != ""
+        ]
 
-        if convert_weekly:
-            df = monthly_to_weekly(df)
-            st.info("Monthly data converted to weekly frequency via linear interpolation.")
+        # ----------------------------------------------
+        # 2) Load, clean, merge
+        # ----------------------------------------------
+        df = load_and_clean_fred_series(series_ids, weekly=resample_weekly)
 
-        # ==================================================
-        # 2. Preprocessing
-        # ==================================================
-        scaler = StandardScaler()
-        df["value_std"] = scaler.fit_transform(df[["value"]])
+        st.subheader("Cleaned & merged data")
+        st.write(df.head())
 
-        # ==================================================
-        # 3. STL decomposition (DESCRIPTIVE)
-        # ==================================================
-        st.subheader("STL decomposition (descriptive analysis)")
+        # ----------------------------------------------
+        # 3) Description
+        # ----------------------------------------------
+        st.subheader("Series description")
 
-        if len(df) >= 2 * 52:
-            stl = STL(
-                df.set_index("date")["value"],
-                period=52,
-                robust=True
-            ).fit()
+        for col in df.columns:
+            if col != "date":
+                st.markdown(f"**{col}**")
+                st.write(f"- Observations: {df[col].notna().sum()}")
+                st.write(
+                    f"- Date range: {df['date'].min().date()} → {df['date'].max().date()}"
+                )
 
-            fig, axes = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
-            axes[0].plot(stl.observed); axes[0].set_title("Observed")
-            axes[1].plot(stl.trend); axes[1].set_title("Trend")
-            axes[2].plot(stl.seasonal); axes[2].set_title("Seasonal")
-            axes[3].plot(stl.resid); axes[3].set_title("Residual")
-            plt.tight_layout()
+        # ----------------------------------------------
+        # 4) Train / Test split (80 / 20)
+        # ----------------------------------------------
+        split_idx = int(0.8 * len(df))
+        train = df.iloc[:split_idx].copy()
+        test = df.iloc[split_idx:].copy()
+
+        # ----------------------------------------------
+        # 5) Standardisation
+        # ----------------------------------------------
+        scalers = {}
+        for col in df.columns:
+            if col != "date":
+                scaler = StandardScaler()
+                train[col + "_std"] = scaler.fit_transform(train[[col]])
+                test[col + "_std"] = scaler.transform(test[[col]])
+                scalers[col] = scaler
+
+        # ----------------------------------------------
+        # 6) Per-series analysis
+        # ----------------------------------------------
+        for col in df.columns:
+            if col == "date":
+                continue
+
+            st.divider()
+            st.header(f"Analysis of {col}")
+
+            y_train = train[col + "_std"]
+
+            # ----- ADF test
+            adf_stat, pval, *_ = adfuller(y_train)
+            st.write(f"ADF statistic: {adf_stat:.3f}")
+            st.write(f"p-value: {pval:.4f}")
+
+            d = 0 if pval < 0.05 else 1
+            st.write(f"Selected differencing order: d = {d}")
+
+            # ----- STL (only if weekly)
+            if resample_weekly:
+                try:
+                    stl = STL(
+                        train.set_index("date")[col],
+                        period=52,
+                        robust=True
+                    )
+                    res = stl.fit()
+
+                    fig, ax = plt.subplots(4, 1, figsize=(8, 6), sharex=True)
+                    ax[0].plot(res.observed); ax[0].set_title("Observed")
+                    ax[1].plot(res.trend); ax[1].set_title("Trend")
+                    ax[2].plot(res.seasonal); ax[2].set_title("Seasonal")
+                    ax[3].plot(res.resid); ax[3].set_title("Residual")
+                    plt.tight_layout()
+                    st.pyplot(fig)
+                    plt.close(fig)
+                except Exception:
+                    st.info("STL decomposition failed.")
+            else:
+                st.info("STL available only with weekly aggregation.")
+
+            # ----- Distribution
+            fig, ax = plt.subplots()
+            sns.histplot(df[col], bins=40, kde=True, ax=ax)
+            ax.set_title("Distribution")
             st.pyplot(fig)
+            plt.close(fig)
 
-        # ==================================================
-        # 4. Stationarity test (ADF)
-        # ==================================================
-        adf_stat, adf_pvalue, *_ = adfuller(df["value_std"].dropna(), autolag="AIC")
+            # ----- Mean per year
+            mean_year = (
+                df.assign(year=df["date"].dt.year)
+                  .groupby("year")[col]
+                  .mean()
+                  .to_frame("mean")
+            )
+            st.write("Average per year")
+            st.dataframe(mean_year)
 
-        st.subheader("Stationarity test (ADF)")
-        st.write(f"ADF p-value: **{adf_pvalue:.4f}**")
+            # ----- ARMA / ARIMA
+            model = sm.tsa.ARIMA(y_train, order=(1, d, 1)).fit()
+            st.write("ARMA / ARIMA summary")
+            st.text(model.summary())
 
-        stationary = adf_pvalue < 0.05
+        # ----------------------------------------------
+        # 7) Joint plot (standardized)
+        # ----------------------------------------------
+        st.divider()
+        st.header("Joint visualization (standardized series)")
 
-        if stationary:
-            order = (1, 0, 1)
-            model_name = "ARMA(1,1)"
-        else:
-            order = (1, 1, 1)
-            model_name = "ARIMA(1,1,1)"
+        fig, ax = plt.subplots(figsize=(9, 4))
+        for col in df.columns:
+            if col != "date":
+                ax.plot(
+                    df["date"],
+                    scalers[col].transform(df[[col]]),
+                    label=col
+                )
 
-        st.write(f"Selected model: **{model_name}**")
+        ax.legend()
+        ax.set_title("Standardized series")
+        st.pyplot(fig)
+        plt.close(fig)
 
-        # ==================================================
-        # 5. Rolling cross-validation
-        # ==================================================
-        st.subheader("Rolling cross-validation")
+        # ----------------------------------------------
+        # 8) Correlation
+        # ----------------------------------------------
+        st.divider()
+        st.header("Correlation between series")
 
-        initial_window = int(0.5 * len(df))
-        errors = rolling_cv(
-            df["value_std"],
-            order=order,
-            initial_window=initial_window
-        )
+        std_cols = [c + "_std" for c in df.columns if c != "date"]
+        corr = pd.concat(
+            [train[std_cols], test[std_cols]]
+        ).corr()
 
-        rmse_cv = np.sqrt(np.mean(errors**2))
-        mae_cv = np.mean(np.abs(errors))
+        st.dataframe(corr)
 
-        st.write(f"CV RMSE: **{rmse_cv:.4f}**")
-        st.write(f"CV MAE: **{mae_cv:.4f}**")
-
-        # ==================================================
-        # 6. Naive benchmark (random walk)
-        # ==================================================
-        naive_errors = df["value_std"].diff().dropna()
-
-        rmse_naive = np.sqrt(np.mean(naive_errors**2))
-        mae_naive = np.mean(np.abs(naive_errors))
-
-        st.write("Naive random walk benchmark:")
-        st.write(f"RMSE: **{rmse_naive:.4f}**")
-        st.write(f"MAE: **{mae_naive:.4f}**")
-
-        # ==================================================
-        # 7. Comparison table
-        # ==================================================
-        results = pd.DataFrame(
-            {
-                "RMSE": [rmse_cv, rmse_naive],
-                "MAE": [mae_cv, mae_naive]
-            },
-            index=[model_name, "Naive random walk"]
-        )
-
-        st.dataframe(results)
+        fig, ax = plt.subplots()
+        sns.heatmap(corr, annot=True, cmap="coolwarm", ax=ax)
+        st.pyplot(fig)
+        plt.close(fig)
 
     except Exception as e:
-        st.error("An error occurred during analysis.")
-        st.exception(e)
+        st.error(str(e))
