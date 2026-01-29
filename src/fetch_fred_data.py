@@ -2,62 +2,81 @@ import os
 import requests
 import pandas as pd
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ======================================================
-# Chargement des variables d'environnement (.env)
+# Load environment variables
 # ======================================================
 load_dotenv()
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
-
 if FRED_API_KEY is None:
-    raise ValueError("FRED_API_KEY non trouvée. Vérifie le fichier .env.")
+    raise ValueError("FRED_API_KEY not found. Please check your .env file.")
 
-# ======================================================
-# Paramètres FRED
-# ======================================================
-SERIES_ID = "GVZCLS"  # CBOE Gold ETF Volatility Index
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 # ======================================================
-# Fonction de récupération des données
+# HTTP session with retries (rate limits, network errors)
 # ======================================================
-def fetch_fred_series(start_date="2006-01-01"):
-    print("=== Début de la récupération des données FRED ===")
-    print(f"Série demandée : {SERIES_ID}")
+def create_session() -> requests.Session:
+    session = requests.Session()
+
+    retry_strategy = Retry(
+        total=5,
+        backoff_factor=1.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    return session
+
+
+# ======================================================
+# Fetch raw FRED data + basic data cleaning
+# ======================================================
+def fetch_fred_series(series_id: str) -> pd.DataFrame:
+    """
+    Fetch a FRED time series and perform basic data cleaning.
+
+    Data cleaning steps:
+    - Parsing dates into datetime format
+    - Numeric coercion of values
+    - Handling missing values
+    """
+
+    session = create_session()
 
     params = {
-        "series_id": SERIES_ID,
+        "series_id": series_id,
         "api_key": FRED_API_KEY,
-        "file_type": "json",
-        "observation_start": start_date
+        "file_type": "json"
     }
 
-    response = requests.get(BASE_URL, params=params, timeout=10)
+    response = session.get(BASE_URL, params=params, timeout=10)
     response.raise_for_status()
 
-    json_data = response.json()
+    data = response.json()
 
-    if "observations" not in json_data:
-        raise ValueError("Aucune observation trouvée dans la réponse FRED.")
+    if "observations" not in data:
+        raise ValueError("No observations found for this FRED series.")
 
-    df = pd.DataFrame(json_data["observations"])
+    # -------------------------------
+    # Data cleaning
+    # -------------------------------
+    df = pd.DataFrame(data["observations"])
 
-    # Nettoyage
+    # Parse dates
     df["date"] = pd.to_datetime(df["date"])
+
+    # Numeric coercion (FRED missing values such as ".")
     df["value"] = pd.to_numeric(df["value"], errors="coerce")
+
+    # Remove missing values
     df = df.dropna(subset=["value"])
 
-    print("=== Données récupérées avec succès ===")
-    print(f"Nombre d'observations : {len(df)}")
-
     return df[["date", "value"]]
-
-# ======================================================
-# Exécution directe du script
-# ======================================================
-if __name__ == "__main__":
-    print("SCRIPT LANCÉ")
-    df = fetch_fred_series()
-    print("\nAperçu des dernières observations :")
-    print(df.tail())
